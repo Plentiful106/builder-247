@@ -1,23 +1,20 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
-import winston from 'winston';
 
-// Configure logging
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.File({ filename: 'nonce-validation.log' }),
-    new winston.transports.Console()
-  ]
-});
-
-// Nonce configuration
+// Configuration constants
 const NONCE_MAX_AGE = 5 * 60 * 1000; // 5 minutes
 const MAX_NONCE_STORE_SIZE = 10000;
+
+// Logging utility
+const log = (level: 'info' | 'warn' | 'error', message: string, details?: object) => {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...details
+  };
+  console[level](JSON.stringify(logEntry));
+};
 
 class NonceManager {
   private nonceStore: Map<string, number>;
@@ -31,15 +28,26 @@ class NonceManager {
    * @returns {string} A unique nonce
    */
   generateNonce(): string {
-    const nonce = crypto.randomBytes(32).toString('hex');
-    const timestamp = Date.now();
+    // Prune old nonces to prevent unbounded growth
+    this.pruneExpiredNonces();
 
-    // Prevent nonce store from growing indefinitely
+    // Prevent store from growing too large
     if (this.nonceStore.size >= MAX_NONCE_STORE_SIZE) {
-      this.pruneExpiredNonces();
+      log('warn', 'Nonce store reached maximum size', { 
+        currentSize: this.nonceStore.size 
+      });
+      this.clearOldestNonces();
     }
 
+    const nonce = crypto.randomBytes(32).toString('hex');
+    const timestamp = Date.now();
+    
     this.nonceStore.set(nonce, timestamp);
+    
+    log('info', 'Nonce generated', { 
+      nonceLength: nonce.length 
+    });
+    
     return nonce;
   }
 
@@ -53,16 +61,20 @@ class NonceManager {
 
     // Check if nonce exists
     if (!timestamp) {
-      logger.warn('Nonce validation failed: Nonce not found', { nonce });
+      log('warn', 'Nonce validation failed: Nonce not found', { 
+        nonceLength: nonce.length 
+      });
       return false;
     }
 
-    // Check nonce age
     const currentTime = Date.now();
-    if (currentTime - timestamp > NONCE_MAX_AGE) {
-      logger.warn('Nonce validation failed: Nonce expired', { 
-        nonce, 
-        age: currentTime - timestamp 
+    const nonceAge = currentTime - timestamp;
+
+    // Check nonce age
+    if (nonceAge > NONCE_MAX_AGE) {
+      log('warn', 'Nonce validation failed: Nonce expired', { 
+        nonceAge,
+        maxAge: NONCE_MAX_AGE 
       });
       this.nonceStore.delete(nonce);
       return false;
@@ -70,11 +82,16 @@ class NonceManager {
 
     // Remove used nonce to prevent replay
     this.nonceStore.delete(nonce);
+    
+    log('info', 'Nonce validated successfully', { 
+      nonceAge 
+    });
+    
     return true;
   }
 
   /**
-   * Prune expired nonces to prevent memory growth
+   * Prune expired nonces from the store
    */
   private pruneExpiredNonces(): void {
     const currentTime = Date.now();
@@ -84,20 +101,35 @@ class NonceManager {
       }
     }
   }
+
+  /**
+   * Clear oldest nonces when store reaches maximum size
+   */
+  private clearOldestNonces(): void {
+    const sortedNonces = Array.from(this.nonceStore.entries())
+      .sort((a, b) => a[1] - b[1]);
+    
+    const excessNonces = sortedNonces.slice(0, 
+      Math.max(0, this.nonceStore.size - MAX_NONCE_STORE_SIZE / 2)
+    );
+
+    for (const [nonce] of excessNonces) {
+      this.nonceStore.delete(nonce);
+    }
+  }
 }
 
-// Singleton instance of NonceManager
+// Singleton instance
 const nonceManager = new NonceManager();
 
 /**
- * Middleware to handle nonce generation and validation
+ * Nonce middleware for request authentication
  * @param {Request} req - Express request object
  * @param {Response} res - Express response object
  * @param {NextFunction} next - Express next middleware function
  */
 export function nonceMiddleware(req: Request, res: Response, next: NextFunction) {
-  // Log nonce validation attempt
-  logger.info('Nonce middleware invoked', { 
+  log('info', 'Nonce middleware processing', { 
     method: req.method, 
     path: req.path 
   });
@@ -113,19 +145,19 @@ export function nonceMiddleware(req: Request, res: Response, next: NextFunction)
 
   // Check for missing nonce
   if (!nonce) {
-    logger.error('Nonce validation failed: Missing nonce', { 
+    log('error', 'Nonce validation failed: Missing nonce', { 
       method: req.method, 
       path: req.path 
     });
     return res.status(400).json({ 
       error: 'Nonce is required',
-      message: 'Please obtain a valid nonce before making this request'
+      message: 'A valid nonce must be provided for this request'
     });
   }
 
   // Validate nonce
   if (!nonceManager.validateNonce(nonce)) {
-    logger.error('Nonce validation failed: Invalid or expired nonce', { 
+    log('error', 'Nonce validation failed: Invalid or expired', { 
       method: req.method, 
       path: req.path 
     });
@@ -135,8 +167,7 @@ export function nonceMiddleware(req: Request, res: Response, next: NextFunction)
     });
   }
 
-  // Log successful nonce validation
-  logger.info('Nonce validation successful', { 
+  log('info', 'Nonce validated successfully', { 
     method: req.method, 
     path: req.path 
   });
