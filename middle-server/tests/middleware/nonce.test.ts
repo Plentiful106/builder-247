@@ -1,15 +1,17 @@
 import { nonceMiddleware } from '../../src/middleware/nonce';
 import { Request, Response, NextFunction } from 'express';
-import winston from 'winston';
 
-// Mock winston logger to prevent actual logging during tests
-jest.mock('winston', () => ({
-  createLogger: jest.fn(() => ({
-    info: jest.fn(),
-    warn: jest.fn(),
-    error: jest.fn()
-  }))
-}));
+// Mock console methods to prevent actual logging during tests
+const originalConsole = { ...console };
+beforeAll(() => {
+  console.info = jest.fn();
+  console.warn = jest.fn();
+  console.error = jest.fn();
+});
+
+afterAll(() => {
+  Object.assign(console, originalConsole);
+});
 
 describe('Nonce Middleware', () => {
   let mockReq: Partial<Request>;
