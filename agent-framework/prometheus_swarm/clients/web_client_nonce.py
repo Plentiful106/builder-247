@@ -1,75 +1,118 @@
 import os
-import secrets
 import time
+import secrets
+import requests
+from functools import lru_cache
+from typing import Optional, Dict, Any
 
-class WebClientNonceManager:
+class WebClientNonceRetriever:
     """
-    Manages nonce generation and validation for web clients.
+    Manages web client nonce retrieval with advanced caching, retry, and error handling.
     
-    A nonce (number used once) is a unique, random value used to prevent replay attacks 
-    and ensure request uniqueness. This implementation provides methods for generating 
-    and validating nonces with configurable expiration.
+    Features:
+    - Server endpoint nonce retrieval
+    - Exponential backoff for network requests
+    - Intelligent caching mechanism
+    - Comprehensive error handling
     """
     
-    def __init__(self, nonce_expiration_seconds=300):
+    def __init__(
+        self, 
+        nonce_endpoint: str = os.getenv('NONCE_ENDPOINT', 'https://default-nonce-service.com/nonce'),
+        max_retries: int = 3,
+        initial_timeout: float = 1.0,
+        cache_size: int = 128
+    ):
         """
-        Initialize the WebClientNonceManager.
+        Initialize the WebClientNonceRetriever.
         
         Args:
-            nonce_expiration_seconds (int): Duration in seconds for which a nonce is valid.
-                Defaults to 5 minutes (300 seconds).
+            nonce_endpoint (str): URL for nonce retrieval
+            max_retries (int): Maximum number of retry attempts
+            initial_timeout (float): Initial timeout for exponential backoff
+            cache_size (int): LRU cache size for nonce storage
         """
-        self._nonce_store = {}
-        self._nonce_expiration = nonce_expiration_seconds
+        self.nonce_endpoint = nonce_endpoint
+        self.max_retries = max_retries
+        self.initial_timeout = initial_timeout
+        self._nonce_cache = {}  # Local nonce cache
     
-    def generate_nonce(self):
+    @lru_cache(maxsize=128)
+    def _cached_nonce_retrieval(self, timestamp: float) -> Optional[str]:
         """
-        Generate a unique, cryptographically secure nonce.
+        Cached nonce retrieval with timestamp to enable cache invalidation.
+        
+        Args:
+            timestamp (float): Current timestamp for cache key
         
         Returns:
-            str: A unique nonce token.
+            Optional[str]: Retrieved nonce or None
         """
-        while True:
-            nonce = secrets.token_urlsafe(32)
-            if nonce not in self._nonce_store:
-                current_time = time.time()
-                self._nonce_store[nonce] = current_time
-                self._clean_expired_nonces()
+        return self._retrieve_nonce_from_server()
+    
+    def _retrieve_nonce_from_server(self) -> Optional[str]:
+        """
+        Retrieve nonce from server with exponential backoff and error handling.
+        
+        Returns:
+            Optional[str]: Retrieved nonce or None
+        """
+        for attempt in range(self.max_retries):
+            try:
+                start_time = time.time()
+                response = requests.get(
+                    self.nonce_endpoint, 
+                    timeout=(3, 10)  # Connection, read timeout
+                )
+                response.raise_for_status()
+                
+                nonce = response.json().get('nonce')
+                retrieval_time = time.time() - start_time
+                
+                # Performance logging
+                if retrieval_time > 0.2:
+                    print(f"WARN: Nonce retrieval took {retrieval_time:.4f} seconds")
+                
                 return nonce
-    
-    def validate_nonce(self, nonce):
-        """
-        Validate a nonce and mark it as used.
+            
+            except (requests.RequestException, ValueError) as e:
+                wait_time = self.initial_timeout * (2 ** attempt)
+                print(f"Nonce retrieval attempt {attempt + 1} failed: {e}")
+                time.sleep(wait_time)
         
-        Args:
-            nonce (str): The nonce to validate.
+        return None
+    
+    def get_nonce(self) -> Optional[str]:
+        """
+        Get a nonce with intelligent caching and retrieval strategy.
         
         Returns:
-            bool: True if the nonce is valid and not expired, False otherwise.
+            Optional[str]: A valid nonce or None
         """
-        if not nonce:
+        current_time = time.time()
+        cached_nonce = self._cached_nonce_retrieval(current_time)
+        
+        if cached_nonce:
+            self._nonce_cache[cached_nonce] = current_time
+            return cached_nonce
+        
+        return None
+    
+    def validate_nonce(self, nonce: str, max_age: float = 300.0) -> bool:
+        """
+        Validate a previously retrieved nonce.
+        
+        Args:
+            nonce (str): Nonce to validate
+            max_age (float): Maximum allowed age for nonce
+        
+        Returns:
+            bool: Whether nonce is valid
+        """
+        if not nonce or nonce not in self._nonce_cache:
             return False
         
         current_time = time.time()
-        self._clean_expired_nonces()
+        nonce_timestamp = self._nonce_cache.get(nonce, 0)
         
-        if nonce in self._nonce_store:
-            nonce_time = self._nonce_store[nonce]
-            if current_time - nonce_time <= self._nonce_expiration:
-                del self._nonce_store[nonce]  # Consume the nonce
-                return True
-        
-        return False
-    
-    def _clean_expired_nonces(self):
-        """
-        Remove expired nonces from the nonce store.
-        """
-        current_time = time.time()
-        expired_nonces = [
-            nonce for nonce, timestamp in self._nonce_store.items()
-            if current_time - timestamp > self._nonce_expiration
-        ]
-        
-        for expired_nonce in expired_nonces:
-            del self._nonce_store[expired_nonce]
+        return (current_time - nonce_timestamp) <= max_age
