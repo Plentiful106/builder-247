@@ -3,7 +3,7 @@ import time
 import pytest
 import requests
 import requests_mock
-from src.web_client_nonce import WebClientNonceRetriever
+from prometheus_swarm.clients.web_client_nonce import WebClientNonceRetriever
 
 @pytest.fixture
 def mock_nonce_endpoint():
